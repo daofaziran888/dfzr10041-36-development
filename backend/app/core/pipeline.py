@@ -16,6 +16,10 @@ from app.core.models import (
     LogEntry, LogFormat, LogSourceConfig, ParseResultStatus, ParseRule,
     QualityReport,
 )
+from app.core.empty_key import (
+    EmptyKeyWorkflow, ResultList, classify_key, describe_source,
+    extract_key, REQUEST_KEY_FIELDS, normalize_key,
+)
 
 # ---------- 预置日志来源配置 ----------
 
@@ -131,10 +135,12 @@ class IngestPipeline:
     6. 产出 ingest_metric 作为质量报告的数据源
     """
 
-    def __init__(self):
+    def __init__(self, empty_key_ledger: Any = None):
         self._checkpoint_store: dict[str, BatchCheckpoint] = {}
         self._event_store: dict[str, list[EventRecord]] = {}
         self._fingerprint_seen: set[str] = set()
+        self.empty_keys = empty_key_ledger if empty_key_ledger is not None else EmptyKeyWorkflow()
+        self.empty_key_ledger = self.empty_keys
 
     # ---------- 数据流 1: log_source → parser_rule → ingest_job → event_store ----------
 
@@ -246,44 +252,201 @@ class IngestPipeline:
 
     # ---------- 数据流 4: event_type → dedup_filter → sample_job ----------
 
-    def dedup_events(self, records: list[EventRecord], dedup_fields: list[str]) -> list[EventRecord]:
+    def dedup_events(self, records: list[EventRecord],
+                     dedup_fields: list[str] | None = None,
+                     empty_key_ledger: Any = None,
+                     *,
+                     empty_key_list: list | None = None,
+                     key_field: str | None = None,
+                     return_report: bool = False,
+                     **kwargs: Any) -> list[EventRecord] | tuple[list[EventRecord], dict]:
         """对事件记录集合执行去重过滤——对应 dedup_filter 模块。
 
-        使用 SHA256 指纹算法，基于指定的去重字段生成指纹。
+        使用 SHA256 指纹算法，基于指定的去重字段生成指纹。请求号缺失/为空时
+        写入空键处置清单，并按真实物理位置保留不同原行；合法文本 ``"0"`` 正常
+        参与指纹去重。
         """
+        if dedup_fields is None:
+            dedup_fields = ["request_id"]
+        if isinstance(empty_key_ledger, bool):
+            return_report = empty_key_ledger or return_report
+            empty_key_ledger = None
+        ledger = empty_key_ledger or kwargs.get("ledger") or self.empty_keys
+        from app.core.empty_key import EmptyKeyLedger as _EmptyKeyLedger
+        if isinstance(ledger, _EmptyKeyLedger):
+            pass
+        elif isinstance(ledger, list):
+            empty_key_list = ledger
+            ledger = self.empty_keys
+        if empty_key_list is not None and hasattr(ledger, "add_sink"):
+            if empty_key_list not in ledger.external_sinks:
+                ledger.add_sink(empty_key_list)
+
+        if key_field is None:
+            request_fields = [f for f in dedup_fields if f in REQUEST_KEY_FIELDS]
+            key_field = request_fields[0] if request_fields else (
+                dedup_fields[0] if len(dedup_fields) == 1 else None)
+
         seen: set[str] = set()
         unique: list[EventRecord] = []
+        empty_entries = []
         for record in records:
-            key_parts = [record.event_type.type_id]
-            for field in sorted(dedup_fields):
-                val = record.parsed_fields.get(field, "")
-                key_parts.append(f"{field}={val}")
-            fp = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
+            field_name = key_field or "request_id"
+            actual_field, raw, _ = extract_key(record, field_name)
+            if actual_field:
+                field_name = actual_field
+            state = classify_key(raw)
+
+            if isinstance(record, dict):
+                event_type = record.get("event_type")
+                type_id = (
+                    getattr(event_type, "type_id", None)
+                    or record.get("event_type_id")
+                    or record.get("type_id")
+                    or "dict-event"
+                )
+                parsed_fields = record.get("parsed_fields")
+                if not isinstance(parsed_fields, dict):
+                    parsed_fields = record
+            else:
+                type_id = record.event_type.type_id
+                parsed_fields = record.parsed_fields
+
+            if state != "valid" and key_field is not None and hasattr(ledger, "register"):
+                entry = ledger.register(record, key_field=field_name)
+                if entry is not None:
+                    empty_entries.append(entry)
+                desc = describe_source(record)
+                fp = hashlib.sha256("|".join([
+                    str(type_id),
+                    f"{field_name}=<{state.upper()}>",
+                    f"physical_id={desc.physical_id}",
+                    f"location={desc.location}",
+                ]).encode()).hexdigest()
+            else:
+                key_parts = [str(type_id)]
+                for field in sorted(dedup_fields):
+                    if isinstance(parsed_fields, dict):
+                        val = parsed_fields.get(field, "")
+                    else:
+                        val = getattr(parsed_fields, field, "")
+                    # 不能用 `or ""`：合法的 0/"0" 必须保留。
+                    val = "" if val is None else str(val)
+                    key_parts.append(f"{field}={val}")
+                fp = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
+
             if fp in seen:
+                if hasattr(ledger, "mark_fingerprint"):
+                    ledger.mark_fingerprint(record, fp, eligible=False)
                 continue
             seen.add(fp)
             unique.append(record)
-        return unique
+            if hasattr(ledger, "mark_fingerprint"):
+                ledger.mark_fingerprint(record, fp, eligible=True)
+
+        entries = getattr(ledger, "entries", empty_entries)
+        result = ResultList(
+            unique,
+            empty_key_disposition_list=entries,
+            empty_key_dispositions=entries,
+            empty_key_list=entries,
+            empty_keys=entries,
+            dispositions=entries,
+            disposition_list=entries,
+            ledger=ledger,
+            empty_entries=empty_entries,
+        )
+        report = {
+            "deduped": result,
+            "empty_keys": getattr(ledger, "entries", empty_entries),
+            "seen_fingerprints": seen,
+            "ledger": ledger,
+        }
+        self.last_dedup_report = report
+        if return_report:
+            return result, report
+        return result
 
     def sample_events(self, records: list[EventRecord], sample_ratio: float,
-                      merge_key: str = "") -> list[EventRecord]:
+                      merge_key: str = "",
+                      empty_key_ledger: Any = None,
+                      **kwargs: Any) -> list[EventRecord]:
         """采样归并——对应 sample_job 模块。
 
-        按 sample_ratio 采样，按 merge_key 归并（同 key 仅保留最新）。
+        合法 ``0`` 键正常归并；空请求号依据空键处置清单按物理位置独立保留，
+        补证后的请求号可用于下一轮归组。
         """
-        sampled: list[EventRecord] = []
-        merged: dict[str, EventRecord] = {}
-        threshold = int(len(records) * sample_ratio)
-        for i, record in enumerate(records):
-            if merge_key:
-                mkey = record.parsed_fields.get(merge_key, "")
-                if mkey:
-                    merged[mkey] = record
-            if i < threshold:
-                sampled.append(record)
-        if merge_key:
-            return list(merged.values())
-        return sampled
+        from app.core.dedup_sample import DedupSamplePipeline
+        from app.core.models import SampleConfig
+
+        ledger = empty_key_ledger or kwargs.get("ledger") or self.empty_keys
+        first = records[0] if records else None
+        if isinstance(first, dict):
+            event_type = first.get("event_type")
+            type_id = getattr(event_type, "type_id", None) or first.get("event_type_id") or "INLINE"
+        else:
+            type_id = getattr(getattr(first, "event_type", None), "type_id", "INLINE")
+        config = SampleConfig(
+            plan_id=kwargs.get("plan_id", "INLINE-SAMPLE"),
+            event_type_id=type_id or "INLINE",
+            sample_ratio=sample_ratio,
+            merge_key=merge_key,
+        )
+        runner = DedupSamplePipeline(
+            dedup_rules=[], sample_configs=[config], empty_key_ledger=ledger)
+        return runner.sample(records, config)
+
+    # ---------- 空键补证/调查工作流委托 ----------
+
+    def supply_evidence(self, *args: Any, **kwargs: Any) -> Any:
+        return self.empty_keys.supply_evidence(*args, **kwargs)
+
+    add_evidence = supply_evidence
+    supplement_evidence = supply_evidence
+    supplement_key = supply_evidence
+
+    def claim_physical(self, *args: Any, **kwargs: Any) -> Any:
+        return self.empty_keys.claim_physical(*args, **kwargs)
+
+    claim_original = claim_physical
+    claim_by_location = claim_physical
+
+    def claim_merged(self, *args: Any, **kwargs: Any) -> Any:
+        return self.empty_keys.claim_merged(*args, **kwargs)
+
+    claim_by_request_id = claim_merged
+
+    def claim_sample(self, *args: Any, **kwargs: Any) -> Any:
+        return self.empty_keys.claim(*args, **kwargs)
+
+    claim = claim_sample
+
+    def confirm_investigation(self, *args: Any, **kwargs: Any) -> Any:
+        return self.empty_keys.confirm_investigation(*args, **kwargs)
+
+    confirm = confirm_investigation
+    confirm_sampling = confirm_investigation
+
+    def plan_round(self, *args: Any, **kwargs: Any) -> Any:
+        return self.empty_keys.plan_round(*args, **kwargs)
+
+    next_round = plan_round
+    run_round = plan_round
+
+    def reconcile_pending(self, *args: Any, **kwargs: Any) -> Any:
+        return self.empty_keys.reconcile_pending(*args, **kwargs)
+
+    @property
+    def pending_dispatch(self):
+        return getattr(self.empty_keys, "pending_dispatch", [])
+
+    @property
+    def deliveries(self):
+        return getattr(self.empty_keys, "deliveries", [])
+
+    @property
+    def confirmations(self):
+        return getattr(self.empty_keys, "confirmations", [])
 
     # ---------- 数据流 6: archive_policy → event_store ----------
 

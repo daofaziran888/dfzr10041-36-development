@@ -226,6 +226,18 @@ class EventRecord:
     source_host: str
     store_partition: str = ""
     index_state: str = "已写入"
+    source_id: str = ""
+    source: str = ""
+    source_path: str = ""
+    file_path: str = ""
+    physical_location: str = ""
+    source_location: str = ""
+    location: str = ""
+    position: str = ""
+    locator: str = ""
+    physical_ref: str = ""
+    line_number: int | None = None
+    line_no: int | None = None
 
 
 @dataclass
@@ -238,15 +250,77 @@ class DedupFilter:
     fingerprint_algo: str = "sha256"
     hit_count: int = 0
     ignore_count: int = 0
+    key_field: str | None = None
 
     def fingerprint(self, event: EventRecord) -> str:
-        """基于去重字段生成事件指纹。"""
-        key_parts = [event.event_type.type_id]
+        """基于去重字段生成事件指纹。
+
+        合法的 ``0``/``"0"`` 不会被 truthy 判断吞掉；请求号类字段缺失或为空时，
+        指纹会绑定真实物理位置，避免把不同的无键原行错误归为同一指纹组。
+        """
+        from app.core.empty_key import (
+            REQUEST_KEY_FIELDS, classify_key, describe_source, normalize_key,
+        )
+
+        if isinstance(event, dict):
+            event_type = event.get("event_type")
+            if hasattr(event_type, "type_id"):
+                type_id = event_type.type_id
+            else:
+                type_id = event.get("event_type_id") or event.get("type_id") or "dict-event"
+            parsed_fields = event.get("parsed_fields")
+            if not isinstance(parsed_fields, dict):
+                parsed_fields = event.get("fields") if isinstance(event.get("fields"), dict) else event
+            masked_fields = event.get("masked_fields") if isinstance(
+                event.get("masked_fields"), dict) else {}
+        else:
+            type_id = event.event_type.type_id
+            parsed_fields = event.parsed_fields
+            masked_fields = event.masked_fields
+
+        key_parts = [type_id]
+        has_empty_request_key = False
         for field in sorted(self.dedup_fields):
-            val = event.parsed_fields.get(field) or event.masked_fields.get(field) or ""
-            key_parts.append(f"{field}={val}")
+            raw: Any = None
+            found = False
+            for container in (parsed_fields, masked_fields):
+                if isinstance(container, dict) and field in container:
+                    raw = container.get(field)
+                    found = True
+                    break
+            if not found and not isinstance(event, dict):
+                raw = getattr(event, field, None)
+                if raw is not None:
+                    found = True
+            state = classify_key(raw if found else None)
+            if state == "valid":
+                val = normalize_key(raw)
+                marker = val
+            else:
+                # 显式区分缺失、空串和纯空白，不再都序列化成 field=。
+                marker = f"<{state.upper()}>"
+                if field in REQUEST_KEY_FIELDS or len(self.dedup_fields) == 1:
+                    has_empty_request_key = True
+            key_parts.append(f"{field}={marker}")
+
+        if has_empty_request_key:
+            desc = describe_source(event)
+            key_parts.extend([
+                f"physical_id={desc.physical_id}",
+                f"source={desc.source_id}",
+                f"location={desc.location}",
+            ])
+
         raw_key = "|".join(key_parts)
         return hashlib.sha256(raw_key.encode()).hexdigest()
+
+    def key_state(self, event: EventRecord, key_field: str | None = None) -> str:
+        """返回去重业务键状态；单字段规则默认检查该字段。"""
+        from app.core.empty_key import classify_key, extract_key
+
+        field = key_field or (self.dedup_fields[0] if len(self.dedup_fields) == 1 else "request_id")
+        _, raw, _ = extract_key(event, field)
+        return classify_key(raw)
 
     def is_duplicate(self, event: EventRecord, seen_fingerprints: set[str]) -> bool:
         """判断事件是否重复。"""
